@@ -1,8 +1,5 @@
 {
-  "env": {
-    "GEMINI_API_KEY": "@gemini_api_key",
-    "ALLOWED_ORIGINS": "@allowed_origins"
-  },
+
   "functions": {
     "api/ocr.js": {
       "memory": 1024,

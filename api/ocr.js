@@ -1,292 +1,328 @@
+import crypto from 'crypto';
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL);
+
+/* ------------------ Config ------------------ */
+
 const CONFIG = {
-    MAX_IMAGES: parseInt(process.env.MAX_IMAGES || '3'),
-    MAX_REQUESTS_PER_WINDOW: parseInt(process.env.RATE_LIMIT || '5'),
-    WINDOW_MS: parseInt(process.env.RATE_WINDOW_MS || '60000'),
-    MAX_IMAGE_SIZE_KB: parseInt(process.env.MAX_IMAGE_SIZE_KB || '1024'),
-    GEMINI_TIMEOUT_MS: parseInt(process.env.GEMINI_TIMEOUT_MS || '25000'),
-    ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || '*').split(',').map(o => o.trim())
+    MAX_IMAGES: Number(process.env.MAX_IMAGES || 3),
+    MAX_REQUESTS_PER_WINDOW: Number(process.env.RATE_LIMIT || 5),
+    WINDOW_MS: Number(process.env.RATE_WINDOW_MS || 60000),
+    MAX_IMAGE_SIZE_KB: Number(process.env.MAX_IMAGE_SIZE_KB || 2048),
+    GEMINI_TIMEOUT_MS: Number(process.env.GEMINI_TIMEOUT_MS || 120000),
+    GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-flash-latest',
+    ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || '')
+        .split(',')
+        .map(o => o.trim())
+        .filter(Boolean),
+    REQUIRE_TOKEN: Boolean(process.env.APP_TOKEN)
 };
 
-// Validate config at startup
 if (!process.env.GEMINI_API_KEY) {
-    console.warn('⚠️ GEMINI_API_KEY not set - OCR will fail');
+    console.warn('⚠️ GEMINI_API_KEY missing');
 }
 
-const rateStore = new Map();
-
-// Cleanup old rate limit entries every 5 minutes
-setInterval(() => {
-    const now = Date.now();
-    for (const [ip, entry] of rateStore.entries()) {
-        if (now - entry.start > CONFIG.WINDOW_MS) {
-            rateStore.delete(ip);
-        }
-    }
-}, 5 * 60 * 1000);
+/* ------------------ Utils ------------------ */
 
 function getIP(req) {
     return (
         req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
-        req.headers['x-real-ip']?.trim() ||
-        req.headers['cf-connecting-ip']?.trim() || // Cloudflare
+        req.headers['x-real-ip'] ||
+        req.headers['cf-connecting-ip'] ||
         'unknown'
     );
 }
 
-function rateLimit(ip) {
+function hashIP(ip) {
+    return crypto.createHash('sha256').update(ip).digest('hex').slice(0, 12);
+}
+
+function getRateKey(req, ip) {
+    const token = req.headers['x-app-token'] || 'anon';
+    return `rate:${token}:${ip}`;
+}
+
+async function isRateLimited(key) {
     const now = Date.now();
-    const entry = rateStore.get(ip);
+    const windowStart = now - CONFIG.WINDOW_MS;
 
-    if (!entry) {
-        rateStore.set(ip, { count: 1, start: now });
-        return false;
+    // sliding window using sorted set
+    await redis.zremrangebyscore(key, 0, windowStart);
+    const count = await redis.zcard(key);
+
+    if (count >= CONFIG.MAX_REQUESTS_PER_WINDOW) {
+        const ttl = await redis.pttl(key);
+        return { limited: true, remaining: 0, reset: Math.ceil(ttl / 1000) };
     }
 
-    if (now - entry.start > CONFIG.WINDOW_MS) {
-        rateStore.set(ip, { count: 1, start: now });
-        return false;
-    }
+    await redis.zadd(key, now, `${now}-${Math.random()}`);
+    await redis.pexpire(key, CONFIG.WINDOW_MS);
 
-    if (entry.count >= CONFIG.MAX_REQUESTS_PER_WINDOW) {
-        return true;
-    }
-
-    entry.count++;
-    return false;
+    return {
+        limited: false,
+        remaining: CONFIG.MAX_REQUESTS_PER_WINDOW - (count + 1),
+        reset: Math.ceil(CONFIG.WINDOW_MS / 1000)
+    };
 }
 
-function setCORSHeaders(res, origin) {
-    const allowedOrigins = CONFIG.ALLOWED_ORIGINS;
-    const isAllowed = allowedOrigins.includes('*') || allowedOrigins.includes(origin);
-
-    if (isAllowed) {
-        res.setHeader('Access-Control-Allow-Origin', origin || '*');
-        res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    }
+function setRateHeaders(res, rate) {
+    res.setHeader('X-RateLimit-Limit', CONFIG.MAX_REQUESTS_PER_WINDOW);
+    res.setHeader('X-RateLimit-Remaining', rate.remaining);
+    res.setHeader('X-RateLimit-Reset', rate.reset);
 }
+
+function setCORS(req, res) {
+    const origin = req.headers.origin;
+
+    if (CONFIG.ALLOWED_ORIGINS.includes('*')) {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+    } else if (CONFIG.ALLOWED_ORIGINS.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-app-token');
+}
+
+function isAuthorized(req) {
+    if (!CONFIG.REQUIRE_TOKEN) return true;
+    return req.headers['x-app-token'] === process.env.APP_TOKEN;
+}
+
+function hashImage(base64) {
+    return crypto.createHash('sha256').update(base64).digest('hex');
+}
+
+/* ------------------ Validation ------------------ */
 
 function validateImages(images) {
-    if (!Array.isArray(images)) {
-        return 'Images must be an array';
-    }
+    if (!Array.isArray(images)) return 'Images must be an array';
+    if (images.length === 0) return 'At least one image required';
+    if (images.length > CONFIG.MAX_IMAGES) return `Max ${CONFIG.MAX_IMAGES} images`;
 
-    if (images.length === 0) {
-        return 'At least one image is required';
-    }
-
-    if (images.length > CONFIG.MAX_IMAGES) {
-        return `Maximum ${CONFIG.MAX_IMAGES} images allowed`;
-    }
+    const allowed = ['image/jpeg', 'image/png', 'image/webp'];
 
     for (let i = 0; i < images.length; i++) {
         const img = images[i];
 
-        // Type check
         if (typeof img !== 'string') {
-            return `Image ${i + 1}: must be a string (data URI)`;
+            return `Image ${i + 1}: must be string`;
         }
 
-        // Format check
-        if (!img.startsWith('data:image/')) {
-            return `Image ${i + 1}: invalid format. Expected data URI (data:image/...)`;
+        const match = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
+        if (!match) {
+            return `Image ${i + 1}: invalid data URI`;
         }
 
-        // Size check - proper base64 overhead calculation
-        // Base64 encoded size is roughly 4/3 of binary size
-        const sizeKB = Buffer.byteLength(img) / 1024;
+        const mime = match[1];
+        const base64 = match[2];
+
+        if (!allowed.includes(mime)) {
+            return `Image ${i + 1}: unsupported format`;
+        }
+
+        // decode first → correct size validation
+        const buffer = Buffer.from(base64, 'base64');
+        const sizeKB = buffer.length / 1024;
+
         if (sizeKB > CONFIG.MAX_IMAGE_SIZE_KB) {
-            return `Image ${i + 1}: exceeds size limit (${sizeKB.toFixed(1)}KB > ${CONFIG.MAX_IMAGE_SIZE_KB}KB)`;
+            return `Image ${i + 1}: too large (${sizeKB.toFixed(1)}KB)`;
         }
     }
 
     return null;
 }
 
-async function callGeminiAPI(images, apiKey) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), CONFIG.GEMINI_TIMEOUT_MS);
+/* ------------------ Gemini ------------------ */
 
-    try {
-        const imageParts = images.map(img => {
-            // Extract base64 data and MIME type from data URI
-            const matches = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
-            if (!matches) {
-                throw new Error('Invalid image data URI format');
-            }
+async function callGemini(images, apiKey) {
+    const parts = images.map(img => {
+        const [, mimeType, data] = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
+        return { inlineData: { mimeType, data } };
+    });
 
-            const [, mimeType, data] = matches;
-
-            return {
-                inlineData: {
-                    mimeType,
-                    data
-                }
-            };
-        });
-
-        const response = await fetch(
-            'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent',
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-goog-api-key': apiKey
+    const body = {
+        generationConfig: {
+            responseMimeType: 'application/json'
+        },
+        contents: [{
+            parts: [
+                {
+                    text: `Extract receipt data as JSON:
+{
+  "store": string|null,
+  "date": string|null,
+  "items": [{ "name": string, "quantity": number, "price": number, "unitPrice": ["number","null"], "subtotal": ["number","null"], "tax": ["number","null"] }],
+  "total": number
+}`
                 },
-                body: JSON.stringify({
-                    generationConfig: {
-                        responseMimeType: 'application/json',
-                        responseSchema: {
-                            type: 'object',
-                            properties: {
-                                store: { type: 'string', description: 'Store or vendor name' },
-                                date: { type: 'string', description: 'Date of purchase (YYYY-MM-DD or raw if unclear)' },
-                                items: {
-                                    type: 'array',
-                                    items: {
-                                        type: 'object',
-                                        properties: {
-                                            name: { type: 'string' },
-                                            quantity: { type: 'number' },
-                                            unitPrice: { type: 'number' },
-                                            price: { type: 'number' }
-                                        },
-                                        required: ['name', 'quantity', 'price']
-                                    }
-                                },
-                                subtotal: { type: 'number' },
-                                tax: { type: 'number' },
-                                total: { type: 'number' }
-                            },
-                            required: ['items', 'total']
-                        }
+                ...parts
+            ]
+        }]
+    };
+
+    let attempt = 0;
+
+    while (attempt < 3) {
+        try {
+            const res = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.GEMINI_MODEL}:generateContent`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-goog-api-key': apiKey
                     },
-                    contents: [{
-                        parts: [
-                            {
-                                text: 'Extract all receipt data from these images. Return structured JSON with store name, items (name, quantity, unit price, total price), subtotal, tax, and final total. Use null for unknown fields.'
-                            },
-                            ...imageParts
-                        ]
-                    }]
-                })
+                    signal: AbortSignal.timeout(CONFIG.GEMINI_TIMEOUT_MS),
+                    body: JSON.stringify(body)
+                }
+            );
+
+            if (res.status >= 500 || res.status === 429) {
+                throw new Error(`retryable-${res.status}`);
             }
-        );
 
-        clearTimeout(timeout);
+            if (!res.ok) {
+                throw new Error(`Gemini ${res.status}`);
+            }
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Gemini API error ${response.status}: ${errorText.slice(0, 200)}`);
+            const data = await res.json();
+            let text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+            if (!text) throw new Error('Invalid Gemini response');
+
+            // strip markdown ```json
+            text = text.replace(/```json|```/g, '').trim();
+
+            try {
+                return {
+                    success: true,
+                    receipt: JSON.parse(text)
+                };
+            } catch (err) {
+                const error = new Error('invalid JSON');
+                error.raw = text;
+                throw error;
+            }
+
+        } catch (err) {
+            if (err.name === 'TimeoutError') {
+                throw new Error('timeout');
+            }
+
+            if (err.message.startsWith('retryable')) {
+                await new Promise(r => setTimeout(r, 2 ** attempt * 500));
+                attempt++;
+                continue;
+            }
+
+            throw err;
         }
-
-        const data = await response.json();
-
-        // Check for API errors in response
-        if (data.error) {
-            throw new Error(`Gemini error: ${data.error.message}`);
-        }
-
-        // Extract text content from response
-        if (!data.candidates?.[0]?.content?.parts?.[0]?.text) {
-            throw new Error('Invalid Gemini response format');
-        }
-
-        return {
-            success: true,
-            receipt: JSON.parse(data.candidates[0].content.parts[0].text)
-        };
-
-    } catch (err) {
-        clearTimeout(timeout);
-
-        if (err.name === 'AbortError') {
-            throw new Error(`Gemini API timeout (${CONFIG.GEMINI_TIMEOUT_MS}ms)`);
-        }
-
-        throw err;
     }
+
+    throw new Error('Gemini failed after retries');
 }
 
-export default async function handler(req, res) {
-    const origin = req.headers.origin || '';
-    setCORSHeaders(res, origin);
+/* ------------------ Handler ------------------ */
 
-    // Handle preflight
+export default async function handler(req, res) {
+    setCORS(req, res);
+
     if (req.method === 'OPTIONS') {
-        return res.status(200).end();
+        return res.status(204).end(); // optimized preflight
     }
 
     if (req.method !== 'POST') {
-        return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+        return res.status(405).json({ error: 'POST only' });
     }
 
     const ip = getIP(req);
-    const requestId = Math.random().toString(36).slice(2, 9);
+    const maskedIP = hashIP(ip);
+    const key = getRateKey(req, ip);
+    const requestId = Math.random().toString(36).slice(2, 8);
 
     try {
-        // Rate limiting
-        if (rateLimit(ip)) {
-            console.warn(`[${requestId}] Rate limit exceeded for IP: ${ip}`);
+        if (!isAuthorized(req)) {
+            return res.status(401).json({ error: 'Unauthorized' });
+        }
+
+        const rate = await isRateLimited(key);
+        setRateHeaders(res, rate);
+
+        if (rate.limited) {
             return res.status(429).json({
                 error: 'Rate limit exceeded',
-                retryAfter: Math.ceil(CONFIG.WINDOW_MS / 1000)
+                retryAfter: rate.reset
             });
         }
 
-        // Validate body
         if (!req.body || typeof req.body !== 'object') {
-            return res.status(400).json({
-                error: 'Request body must be JSON',
-                example: { images: ['data:image/jpeg;base64,...'] }
-            });
+            return res.status(400).json({ error: 'Invalid JSON body' });
         }
 
         const { images } = req.body;
 
-        // Validate images
         const validationError = validateImages(images);
         if (validationError) {
-            console.warn(`[${requestId}] Validation error: ${validationError}`);
             return res.status(400).json({ error: validationError });
         }
 
-        // Check API key
         const apiKey = process.env.GEMINI_API_KEY;
         if (!apiKey) {
-            console.error(`[${requestId}] GEMINI_API_KEY not configured`);
-            return res.status(500).json({
-                error: 'Server misconfigured',
-                details: 'GEMINI_API_KEY environment variable is not set'
+            return res.status(500).json({ error: 'Server misconfigured' });
+        }
+
+        console.log(`[${requestId}] ${maskedIP} -> ${images.length} images`);
+
+        // 1. Create a single hash for the entire batch of images
+        const requestHash = hashImage(images.join(''));
+        const cacheKey = `ocr:${requestHash}`;
+
+        // 2. Check if this exact batch of images has been processed recently
+        const cachedData = await redis.get(cacheKey);
+        if (cachedData) {
+            console.log(`[${requestId}] Cache hit for ${maskedIP}`);
+            const parsedCache = JSON.parse(cachedData);
+            
+            // Return the stored result, and inject 'cached: true' so the client knows
+            return res.status(200).json({ 
+                ...parsedCache, 
+                cached: true 
             });
         }
 
-        // Call Gemini
-        console.log(`[${requestId}] Processing ${images.length} image(s)`);
-        const result = await callGeminiAPI(images, apiKey);
+        // 3. Not in cache -> Call Gemini
+        const result = await callGemini(images, apiKey);
 
-        console.log(`[${requestId}] Success`);
+        // 4. Save the actual result object to Redis as a string for 5 minutes (300s)
+        await redis.set(cacheKey, JSON.stringify(result), 'EX', 300);
+
         return res.status(200).json(result);
 
     } catch (err) {
-        console.error(`[${requestId}] Error: ${err.message}`);
+        console.error(`[${requestId}]`, err.message);
 
-        // Determine appropriate status code
-        let statusCode = 500;
-        let errorMsg = 'OCR processing failed';
+        let status = 500;
+        let error = 'OCR failed';
 
-        if (err.message.includes('timeout')) {
-            statusCode = 504;
-            errorMsg = 'Backend service timeout';
-        } else if (err.message.includes('API')) {
-            statusCode = 503;
-            errorMsg = 'External service error';
+        if (err.message === 'timeout') {
+            status = 504;
+            error = 'Timeout';
         }
 
-        return res.status(statusCode).json({
-            error: errorMsg,
-            requestId, // For debugging
-            details: process.env.NODE_ENV === 'development' ? err.message : undefined
+        if (err.message === 'invalid JSON') {
+            status = 502;
+            error = 'Invalid JSON from AI';
+        }
+
+        return res.status(status).json({
+            error,
+            requestId,
+            ...(process.env.NODE_ENV !== 'production' && {
+                details: err.message,
+                raw: err.raw
+            })
         });
     }
-};
+}

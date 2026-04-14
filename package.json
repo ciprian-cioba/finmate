@@ -4,7 +4,6 @@
   "description": "Receipt OCR backend powered by Google Gemini on Vercel",
   "type": "module",
   "scripts": {
-     
     "build": "echo 'No build step needed'",
     "test:local": "node test-local.js"
   },
@@ -22,5 +21,9 @@
   },
   "engines": {
     "node": "20.x"
+  },
+  "dependencies": {
+    "ioredis": "^5.10.1",
+    "redis": "^5.12.1"
   }
 }
