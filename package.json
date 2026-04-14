@@ -1,0 +1,26 @@
+{
+  "name": "receipt-ocr",
+  "version": "1.0.0",
+  "description": "Receipt OCR backend powered by Google Gemini on Vercel",
+  "type": "module",
+  "scripts": {
+     
+    "build": "echo 'No build step needed'",
+    "test:local": "node test-local.js"
+  },
+  "keywords": [
+    "ocr",
+    "receipt",
+    "vercel",
+    "gemini",
+    "serverless"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "vercel": "latest"
+  },
+  "engines": {
+    "node": "20.x"
+  }
+}
