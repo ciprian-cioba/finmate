@@ -39,29 +39,54 @@ function getRateKey(req, ip) {
     return `rate:${token}:${hashString(ip).slice(0, 12)}`;
 }
 
-// [Merged] Atomic sliding window rate limiting with fail-open safety
+// [FIXED] Atomic Sliding Window using Lua (Restores Concurrency Safety & Checks Before Adding)
 async function isRateLimited(key) {
     try {
         const now = Date.now();
         const windowStart = now - CONFIG.WINDOW_MS;
+        const member = `${now}-${Math.random()}`;
 
-        const multi = redis.multi();
-        multi.zremrangebyscore(key, 0, windowStart);
-        multi.zcard(key);
-        multi.zadd(key, now, `${now}-${Math.random()}`);
-        multi.pexpire(key, CONFIG.WINDOW_MS);
-        
-        const results = await multi.exec();
-        const count = results[1][1]; 
+        // Lua script ensures atomicity. It removes old entries, checks the count, 
+        // and only adds the new entry if under the limit.
+        const script = `
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+            local count = redis.call('ZCARD', KEYS[1])
+            if count < tonumber(ARGV[3]) then
+                redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
+                redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
+                return {count, 1} -- 1 means added
+            else
+                local pttl = redis.call('PTTL', KEYS[1])
+                return {count, 0, pttl} -- 0 means rejected
+            end
+        `;
 
-        if (count >= CONFIG.MAX_REQUESTS_PER_WINDOW) {
-            const ttl = await redis.pttl(key);
-            return { limited: true, remaining: 0, reset: Math.ceil(ttl / 1000) };
+        const result = await redis.eval(
+            script, 
+            1, 
+            key, 
+            windowStart, 
+            now, 
+            CONFIG.MAX_REQUESTS_PER_WINDOW, 
+            member, 
+            CONFIG.WINDOW_MS
+        );
+
+        const currentCount = result[0];
+        const wasAdded = result[1] === 1;
+
+        if (!wasAdded) {
+            const ttl = result[2];
+            return { 
+                limited: true, 
+                remaining: 0, 
+                reset: Math.ceil(ttl / 1000) 
+            };
         }
 
         return {
             limited: false,
-            remaining: CONFIG.MAX_REQUESTS_PER_WINDOW - (count + 1),
+            remaining: CONFIG.MAX_REQUESTS_PER_WINDOW - (currentCount + 1),
             reset: Math.ceil(CONFIG.WINDOW_MS / 1000)
         };
     } catch (e) {
