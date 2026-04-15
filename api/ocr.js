@@ -14,7 +14,7 @@ const CONFIG = {
     MAX_IMAGE_SIZE_KB: Number(process.env.MAX_IMAGE_SIZE_KB || 2048),
     GEMINI_TIMEOUT_MS: Number(process.env.GEMINI_TIMEOUT_MS || 120000),
     GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-flash-latest',
-    ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean),
+    ALLOWED_ORIGINS: ["*"], //(process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean),
     REQUIRE_TOKEN: Boolean(process.env.APP_TOKEN)
 };
 
@@ -90,13 +90,26 @@ async function isRateLimited(key) {
 // [Original Feature] Modular CORS
 function setCORS(req, res) {
     const origin = req.headers.origin;
-    if (CONFIG.ALLOWED_ORIGINS.includes('*')) {
-        res.setHeader('Access-Control-Allow-Origin', '*');
-    } else if (CONFIG.ALLOWED_ORIGINS.includes(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
+    
+    // Check if origin is allowed
+    const isAllowed = CONFIG.ALLOWED_ORIGINS.includes('*') || CONFIG.ALLOWED_ORIGINS.includes(origin);
+    
+    if (isAllowed) {
+        res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    } else {
+        // Log this! It will tell you exactly which origin is being rejected.
+        console.error(`CORS BLOCKED: Origin ${origin} not in allowed list`);
     }
+    
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-app-token');
+    
+    // Crucial: Ensure OPTIONS request returns 200 quickly and stops processing
+    if (req.method === 'OPTIONS') {
+        res.status(204).send();
+        return true; // Signal that response was sent
+    }
+    return false;
 }
 
 function isAuthorized(req) {
