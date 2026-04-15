@@ -21,12 +21,17 @@ const CONFIG = {
 /* ------------------ Utils ------------------ */
 
 function getIP(req) {
-    return (
-        req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
-        req.headers['x-real-ip'] ||
-        req.headers['cf-connecting-ip'] ||
-        'unknown'
-    );
+    // Vercel specific: the first IP in x-forwarded-for is the actual user
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    if (xForwardedFor) {
+        const ips = xForwardedFor.split(',');
+        return ips[0].trim();
+    }
+    // Fallbacks for other environments
+    return req.headers['x-real-ip'] || 
+           req.headers['cf-connecting-ip'] || 
+           req.socket.remoteAddress || 
+           '127.0.0.1';
 }
 
 function hashString(str) {
@@ -44,55 +49,41 @@ async function isRateLimited(key) {
     try {
         const now = Date.now();
         const windowStart = now - CONFIG.WINDOW_MS;
-        const member = `${now}-${Math.random()}`;
-
-        // Lua script ensures atomicity. It removes old entries, checks the count, 
-        // and only adds the new entry if under the limit.
+        
+        // LUA Script for absolute atomicity
         const script = `
             redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
             local count = redis.call('ZCARD', KEYS[1])
             if count < tonumber(ARGV[3]) then
                 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
                 redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
-                return {count, 1} -- 1 means added
+                return {count, 1}
             else
                 local pttl = redis.call('PTTL', KEYS[1])
-                return {count, 0, pttl} -- 0 means rejected
+                return {count, 0, pttl}
             end
         `;
 
-        const result = await redis.eval(
-            script, 
-            1, 
-            key, 
-            windowStart, 
-            now, 
-            CONFIG.MAX_REQUESTS_PER_WINDOW, 
-            member, 
-            CONFIG.WINDOW_MS
-        );
+        const result = await redis.eval(script, 1, key, windowStart, now, CONFIG.MAX_REQUESTS_PER_WINDOW, `${now}-${Math.random()}`, CONFIG.WINDOW_MS);
+        
+        const count = result[0];
+        const allowed = result[1] === 1;
 
-        const currentCount = result[0];
-        const wasAdded = result[1] === 1;
+        // DEBUG LOG: Look for this in Vercel Logs
+        console.log(`[RateLimit Check] Key: ${key} | Count: ${count} | Allowed: ${allowed}`);
 
-        if (!wasAdded) {
-            const ttl = result[2];
-            return { 
-                limited: true, 
-                remaining: 0, 
-                reset: Math.ceil(ttl / 1000) 
-            };
+        if (!allowed) {
+            return { limited: true, remaining: 0, reset: Math.ceil(result[2] / 1000) };
         }
 
         return {
             limited: false,
-            remaining: CONFIG.MAX_REQUESTS_PER_WINDOW - (currentCount + 1),
+            remaining: CONFIG.MAX_REQUESTS_PER_WINDOW - (count + 1),
             reset: Math.ceil(CONFIG.WINDOW_MS / 1000)
         };
     } catch (e) {
-        // [Added from v2] Fail-open: proceed if Redis is down
-        console.error("Rate limit check failed, failing open:", e.message);
-        return { limited: false, remaining: 1, reset: 60 };
+        console.error("RATE LIMIT CRITICAL FAILURE:", e);
+        return { limited: false, remaining: 1, reset: 60 }; 
     }
 }
 
