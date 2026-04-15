@@ -12,7 +12,7 @@ const CONFIG = {
     MAX_REQUESTS_PER_WINDOW: Number(process.env.RATE_LIMIT || 5),
     WINDOW_MS: Number(process.env.RATE_WINDOW_MS || 60000),
     MAX_IMAGE_SIZE_KB: Number(process.env.MAX_IMAGE_SIZE_KB || 2048),
-    GEMINI_TIMEOUT_MS: Number(process.env.GEMINI_TIMEOUT_MS || 25000),
+    GEMINI_TIMEOUT_MS: Number(process.env.GEMINI_TIMEOUT_MS || 120000),
     GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-flash-latest',
     ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean),
     REQUIRE_TOKEN: Boolean(process.env.APP_TOKEN)
