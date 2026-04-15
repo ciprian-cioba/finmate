@@ -1,258 +1,120 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>OCR Backend Test</title>
-
-<style>
-    body {
-        font-family: system-ui, sans-serif;
-        max-width: 600px;
-        margin: 40px auto;
-        padding: 16px;
-        background: #0f172a;
-        color: #e2e8f0;
-    }
-
-    h1 {
-        font-size: 24px;
-        margin-bottom: 8px;
-    }
-
-    .subtitle {
-        opacity: 0.7;
-        margin-bottom: 24px;
-        font-size: 14px;
-    }
-
-    .form-group {
-        margin-bottom: 16px;
-    }
-
-    label {
-        display: block;
-        margin-bottom: 6px;
-        font-size: 13px;
-        opacity: 0.8;
-    }
-
-    input[type="file"], button {
-        width: 100%;
-        padding: 12px;
-        border-radius: 8px;
-        border: none;
-        font-size: 14px;
-    }
-
-    input[type="file"] {
-        background: #1e293b;
-        color: #94a3b8;
-        cursor: pointer;
-    }
-
-    input[type="file"]::file-selector-button {
-        background: #334155;
-        color: white;
-        padding: 8px 16px;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-        margin-right: 8px;
-    }
-
-    button {
-        background: #22c55e;
-        color: black;
-        font-weight: bold;
-        cursor: pointer;
-        transition: opacity 0.2s;
-    }
-
-    button:hover:not(:disabled) {
-        opacity: 0.9;
-    }
-
-    button:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-    }
-
-    .file-info {
-        margin-top: 8px;
-        font-size: 12px;
-        opacity: 0.7;
-    }
-
-    .status {
-        margin-top: 16px;
-        padding: 10px;
-        border-radius: 6px;
-        font-size: 13px;
-        background: #1e293b;
-    }
-
-    .status.loading {
-        color: #3b82f6;
-    }
-
-    .status.error {
-        color: #ef4444;
-        background: #7f1d1d;
-    }
-
-    .status.success {
-        color: #22c55e;
-        background: #15803d;
-    }
-
-    pre {
-        margin-top: 16px;
-        padding: 14px;
-        background: #020617;
-        border-radius: 8px;
-        overflow-x: auto;
-        font-size: 12px;
-        max-height: 400px;
-        overflow-y: auto;
-        border: 1px solid #334155;
-    }
-
-    .response-section {
-        margin-top: 24px;
-    }
-
-    .section-title {
-        font-size: 12px;
-        opacity: 0.6;
-        margin-bottom: 8px;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
-</style>
-</head>
-<body>
-
-<h1>📋 Receipt OCR Test</h1>
-<p class="subtitle">Upload receipt images to extract structured data</p>
-
-<div class="form-group">
-    <label for="fileInput">Select Images (JPEG, PNG)</label>
-    <input type="file" id="fileInput" accept="image/jpeg,image/png" multiple />
-    <div class="file-info" id="fileInfo">No files selected</div>
-</div>
-
-<button id="scanBtn">Scan Receipt</button>
-
-<div class="status" id="status">Ready</div>
-
-<div class="response-section">
-    <div class="section-title">Response</div>
-    <pre id="output">Waiting for submission...</pre>
-</div>
-
-<script>
 const fileInput = document.getElementById('fileInput');
 const scanBtn = document.getElementById('scanBtn');
 const output = document.getElementById('output');
 const status = document.getElementById('status');
 const fileInfo = document.getElementById('fileInfo');
 
-// Update file info display
+// [New] Client-side Compression Logic
+async function compressImage(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = (event) => {
+            const img = new Image();
+            img.src = event.target.result;
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                let width = img.width;
+                let height = img.height;
+
+                // Max resolution 1600px (Plenty for Gemini/OCR)
+                const MAX_SIZE = 1600;
+                if (width > height) {
+                    if (width > MAX_SIZE) {
+                        height *= MAX_SIZE / width;
+                        width = MAX_SIZE;
+                    }
+                } else {
+                    if (height > MAX_SIZE) {
+                        width *= MAX_SIZE / height;
+                        height = MAX_SIZE;
+                    }
+                }
+
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+                
+                // Compress to JPEG at 0.8 quality
+                resolve(canvas.toDataURL('image/jpeg', 0.8));
+            };
+            img.onerror = reject;
+        };
+        reader.onerror = reject;
+    });
+}
+
 fileInput.addEventListener('change', () => {
     const files = Array.from(fileInput.files);
     if (files.length === 0) {
         fileInfo.textContent = 'No files selected';
         return;
     }
-
-    const total = files.reduce((sum, f) => sum + f.size, 0);
-    const sizeStr = (total / 1024).toFixed(1);
-    fileInfo.textContent = `${files.length} file(s) • ${sizeStr} KB`;
+    const totalSize = (files.reduce((sum, f) => sum + f.size, 0) / 1024).toFixed(1);
+    fileInfo.textContent = `${files.length} file(s) • ~${totalSize} KB (Raw)`;
 });
-
-function toBase64(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
-        reader.readAsDataURL(file);
-    });
-}
-
-function updateStatus(message, type = 'loading') {
-    status.textContent = message;
-    status.className = `status ${type}`;
-}
 
 scanBtn.onclick = async () => {
     try {
         const files = Array.from(fileInput.files);
-
         if (files.length === 0) {
             updateStatus('❌ Please select at least one image', 'error');
             return;
         }
 
-        if (files.length > 3) {
-            updateStatus('❌ Maximum 3 images allowed', 'error');
-            return;
-        }
-
         scanBtn.disabled = true;
-        updateStatus('📁 Encoding images...', 'loading');
+        updateStatus('⚙️ Compressing images...', 'loading');
 
-        const images = await Promise.all(files.map(toBase64));
+        // Compress all images in parallel
+        const images = await Promise.all(files.map(compressImage));
+        
+        const compressedSize = images.reduce((acc, cur) => acc + cur.length, 0);
+        console.log(`Payload size: ${(compressedSize / 1024).toFixed(1)} KB`);
 
         updateStatus('🚀 Sending to backend...', 'loading');
 
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
+        const timeout = setTimeout(() => controller.abort(), 45000); // Increased to 45s
 
         const res = await fetch('/api/ocr', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 
+                'Content-Type': 'application/json',
+                'x-app-token': 'YOUR_OPTIONAL_TOKEN' // Ensure this matches your REQUIRE_TOKEN config
+            },
             body: JSON.stringify({ images }),
             signal: controller.signal
         });
 
         clearTimeout(timeout);
-
         const text = await res.text();
 
         if (!res.ok) {
-            updateStatus(`❌ Server error (${res.status})`, 'error');
-            try {
-                const json = JSON.parse(text);
-                output.textContent = JSON.stringify(json, null, 2);
-            } catch {
-                output.textContent = text || 'No response body';
+            // Check for 429 specifically
+            if (res.status === 429) {
+                const data = JSON.parse(text);
+                updateStatus(`⏳ Rate Limited. Try again in ${data.retryAfter}s`, 'error');
+            } else {
+                updateStatus(`❌ Server error (${res.status})`, 'error');
             }
+            output.textContent = text;
             return;
         }
 
-        try {
-            const json = JSON.parse(text);
-            output.textContent = JSON.stringify(json, null, 2);
-            updateStatus('✅ Success', 'success');
-        } catch {
-            output.textContent = text;
-            updateStatus('⚠️ Invalid JSON response', 'error');
-        }
+        const json = JSON.parse(text);
+        output.textContent = JSON.stringify(json, null, 2);
+        updateStatus(json.cached ? '✅ Success (Cached)' : '✅ Success', 'success');
 
     } catch (err) {
-        if (err.name === 'AbortError') {
-            updateStatus('❌ Request timeout (30s)', 'error');
-            output.textContent = 'The server took too long to respond.';
-        } else {
-            updateStatus(`❌ ${err.message}`, 'error');
-            output.textContent = err.stack || err.message;
-        }
+        updateStatus(`❌ ${err.message}`, 'error');
+        output.textContent = err.stack || err.message;
     } finally {
         scanBtn.disabled = false;
     }
 };
-</script>
 
-</body>
-</html>
+function updateStatus(message, type = 'loading') {
+    status.textContent = message;
+    status.className = `status ${type}`;
+}
