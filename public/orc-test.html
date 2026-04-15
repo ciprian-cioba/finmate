@@ -1,3 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>OCR Backend Test</title>
+
+<style>
+    body {
+        font-family: system-ui, sans-serif;
+        max-width: 600px;
+        margin: 40px auto;
+        padding: 16px;
+        background: #0f172a;
+        color: #e2e8f0;
+    }
+
+    h1 {
+        font-size: 24px;
+        margin-bottom: 8px;
+    }
+
+    .subtitle {
+        opacity: 0.7;
+        margin-bottom: 24px;
+        font-size: 14px;
+    }
+
+    .form-group {
+        margin-bottom: 16px;
+    }
+
+    label {
+        display: block;
+        margin-bottom: 6px;
+        font-size: 13px;
+        opacity: 0.8;
+    }
+
+    input[type="file"], button {
+        width: 100%;
+        padding: 12px;
+        border-radius: 8px;
+        border: none;
+        font-size: 14px;
+    }
+
+    input[type="file"] {
+        background: #1e293b;
+        color: #94a3b8;
+        cursor: pointer;
+    }
+
+    input[type="file"]::file-selector-button {
+        background: #334155;
+        color: white;
+        padding: 8px 16px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        margin-right: 8px;
+    }
+
+    button {
+        background: #22c55e;
+        color: black;
+        font-weight: bold;
+        cursor: pointer;
+        transition: opacity 0.2s;
+    }
+
+    button:hover:not(:disabled) {
+        opacity: 0.9;
+    }
+
+    button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    .file-info {
+        margin-top: 8px;
+        font-size: 12px;
+        opacity: 0.7;
+    }
+
+    .status {
+        margin-top: 16px;
+        padding: 10px;
+        border-radius: 6px;
+        font-size: 13px;
+        background: #1e293b;
+    }
+
+    .status.loading {
+        color: #3b82f6;
+    }
+
+    .status.error {
+        color: #ef4444;
+        background: #7f1d1d;
+    }
+
+    .status.success {
+        color: #22c55e;
+        background: #15803d;
+    }
+
+    pre {
+        margin-top: 16px;
+        padding: 14px;
+        background: #020617;
+        border-radius: 8px;
+        overflow-x: auto;
+        font-size: 12px;
+        max-height: 400px;
+        overflow-y: auto;
+        border: 1px solid #334155;
+    }
+
+    .response-section {
+        margin-top: 24px;
+    }
+
+    .section-title {
+        font-size: 12px;
+        opacity: 0.6;
+        margin-bottom: 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+</style>
+</head>
+<body>
+
+<h1>📋 Receipt OCR Test</h1>
+<p class="subtitle">Upload receipt images to extract structured data</p>
+
+<div class="form-group">
+    <label for="fileInput">Select Images (JPEG, PNG)</label>
+    <input type="file" id="fileInput" accept="image/jpeg,image/png" multiple />
+    <div class="file-info" id="fileInfo">No files selected</div>
+</div>
+
+<button id="scanBtn">Scan Receipt</button>
+
+<div class="status" id="status">Ready</div>
+
+<div class="response-section">
+    <div class="section-title">Response</div>
+    <pre id="output">Waiting for submission...</pre>
+</div>
+
+<script>
 const fileInput = document.getElementById('fileInput');
 const scanBtn = document.getElementById('scanBtn');
 const output = document.getElementById('output');
@@ -118,3 +272,7 @@ function updateStatus(message, type = 'loading') {
     status.textContent = message;
     status.className = `status ${type}`;
 }
+</script>
+
+</body>
+</html>
