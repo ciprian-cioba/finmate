@@ -124,7 +124,7 @@ async function callGemini(images, apiKey) {
         generationConfig: { responseMimeType: 'application/json' },
         contents: [{
             parts: [
-                { text: `Extract receipt data as JSON: {"store": string|null, "date": string|null, "items": [{"name": string, "quantity": number, "price": number}], "total": number}` },
+                { text: `Extract receipt data as JSON: {"store": string|null, "date": string|null, "items": [{"name": string, "qty": 1, "price": 0.0, "weight": '500g or -', "discount": '0% or -'}], "total": number}` },
                 ...parts
             ]
         }]
