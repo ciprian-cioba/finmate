@@ -159,45 +159,56 @@ async function callGemini(images, apiKey) {
         }]
     };
 
-    let attempt = 0;
-    while (attempt < 3) {
-        try {
-            const res = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.GEMINI_MODEL}:generateContent`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-                    signal: AbortSignal.timeout(CONFIG.GEMINI_TIMEOUT_MS),
-                    body: JSON.stringify(body)
-                }
-            );
-
-            if (res.status === 429 || res.status >= 500) throw new Error(`retryable-${res.status}`);
-            if (!res.ok) throw new Error(`Gemini Error ${res.status}`);
-
-            const data = await res.json();
-            let text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (!text) throw new Error('Invalid Gemini response');
-
-            text = text.replace(/```json|```/g, '').trim();
-
-            try {
-                return { success: true, receipt: JSON.parse(text) };
-            } catch (err) {
-                const error = new Error('invalid JSON');
-                error.raw = text; 
-                throw error;
-            }
-        } catch (err) {
-            // [Original Feature] Exponential backoff
-            if (err.message.startsWith('retryable') && attempt < 2) {
-                await new Promise(r => setTimeout(r, 2 ** attempt * 500));
-                attempt++;
-                continue;
-            }
-            throw err;
+    try {
+    const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.GEMINI_MODEL}:generateContent`,
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': apiKey
+            },
+            signal: AbortSignal.timeout(CONFIG.GEMINI_TIMEOUT_MS),
+            body: JSON.stringify(body)
         }
+    );
+
+    // hard fail on rate limits or server errors
+    if (res.status === 429) {
+        throw new Error('RATE_LIMIT');
     }
+    if (res.status >= 500) {
+        throw new Error(`SERVER_ERROR_${res.status}`);
+    }
+    if (!res.ok) {
+        throw new Error(`Gemini Error ${res.status}`);
+    }
+
+    const data = await res.json();
+    let text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!text) {
+        throw new Error('EMPTY_RESPONSE');
+    }
+
+    text = text.replace(/```json|```/g, '').trim();
+
+    try {
+        return { success: true, receipt: JSON.parse(text) };
+    } catch {
+        const error = new Error('INVALID_JSON');
+        error.raw = text;
+        throw error;
+    }
+
+} catch (err) {
+    // no retry logic — just propagate
+    return {
+        success: false,
+        error: err.message,
+        raw: err.raw || null
+    };
+}
 }
 
 /* ------------------ Handler ------------------ */
